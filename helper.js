@@ -3,6 +3,7 @@ const math = require('mathjs');
 const XLSX = require('xlsx');
 const Promise = require('bluebird');
 const csv_parse = Promise.promisify(require('csv-parse'));
+const _ = require('lodash');
 
 var exports = module.exports = {};
 
@@ -28,27 +29,74 @@ exports.sort = function(req) {
 
 exports.search = function(req, strAttributes) {
   selectOpts = {}
+
   if (req.query.filter) {
-    fieldClauses = []
-    strAttributes.forEach(function(x) {
-      fieldWhereClause = {}
-      fieldWhereClause[x] = {
-        $like: "%" + req.query.filter + "%"
+    fieldClauses = [];
+
+    var queryObj;
+
+    try {
+      var queryObj = JSON.parse(req.query.filter);
+      if ("extended" in queryObj) {
+        for (var property in queryObj.extended) {
+          if (queryObj.extended.hasOwnProperty(property)) {
+            fieldWhereClause = {};
+
+            if (property == "dateFrom" || property == "dateTo") {
+              //date from and to:
+            } else {
+              fieldWhereClause[property] = { $like: "%" + queryObj.extended[property] + "%" };
+              fieldClauses = fieldClauses.concat([fieldWhereClause]);
+            }
+          }
+        }
+
+        if (queryObj.extended.hasOwnProperty('dateFrom')) {
+          fieldWhereClause = {};
+
+          fieldWhereClause['createdAt'] = { $between: [queryObj.extended['dateFrom'], queryObj.extended['dateTo']] };
+          fieldClauses = fieldClauses.concat([fieldWhereClause]);
+        }
       }
-      fieldClauses = fieldClauses.concat([fieldWhereClause])
-    })
-    selectOpts['where'] = {
-      $or: fieldClauses
+
+      selectOpts["where"] = { $and: fieldClauses };
+      return selectOpts;
+    } catch (e) {      
+      strAttributes.forEach(function(x) {
+        fieldWhereClause = {};
+        if (x !== "id") {
+          fieldWhereClause[x] = { $like: "%" + req.query.filter + "%" };
+          fieldClauses = fieldClauses.concat([fieldWhereClause]);
+        } else {
+          if (/^\d+$/.test(req.query.filter)) {
+            fieldWhereClause[x] = req.query.filter;
+
+            fieldClauses = fieldClauses.concat([fieldWhereClause]);
+          }
+        }
+      });
+      selectOpts["where"] = { $or: fieldClauses };
+
+      return selectOpts;
     }
   }
   return selectOpts;
+}
+
+exports.includeAssociations = function (req) {
+  return req.query.excludeAssociations ? {} : {
+    include: [{
+      all: true
+    }]
+  }
 }
 
 exports.searchPaginate = function(req, strAttributes) {
   return objectAssign(
     exports.search(req, strAttributes),
     exports.sort(req),
-    exports.paginate(req)
+    exports.paginate(req),
+    exports.includeAssociations(req)
   );
 }
 
@@ -139,12 +187,19 @@ exports.prevNextPageUrl = function(req, isPrevious) {
 }
 
 exports.vueTable = function(req, model, strAttributes) {
-  return model.findAll(exports.searchPaginate(req, strAttributes)).then(
-    function(x) {
-      lastPage = math.ceil(x.length / req.query.per_page)
+  search = exports.search(req, strAttributes)
+  searchSortPagIncl = exports.searchPaginate( req, strAttributes )
+  queries = []
+  queries.push(model.findAll(search))
+  queries.push(model.findAll(searchSortPagIncl))
+  return Promise.all(queries).then(
+    function(res) {
+      searchRes = res[0]
+      paginatedSearchRes = res[1]
+      lastPage = math.ceil(searchRes.length / req.query.per_page)
       return {
-        data: x,
-        total: x.length,
+        data: paginatedSearchRes,
+        total: searchRes.length,
         per_page: req.query.per_page,
         current_page: req.query.page,
         'from': (req.query.page - 1) * req.query.per_page + 1,
@@ -156,4 +211,37 @@ exports.vueTable = function(req, model, strAttributes) {
           req, false)
       }
     })
+}
+
+exports.dataModel = function(modelObjs) {
+  var modelObj = modelObjs[0];
+  var data = modelObjs[0].dataValues;
+  for(var key in modelObj.dataValues){
+    data[key] = ({}).toString.call(modelObj.dataValues[key]).match(/\s([a-zA-Z]+)/)[1].toLowerCase();
+  }
+  return data;
+}
+
+exports.assignForIntersectedKeys = function(options, body) {
+  var updated = _.pick(body, _.keys(options));
+  return updated;
+};
+
+exports.sendExcel = function(data, res, workbook, worksheet, tempFilePath, filetodownload) {
+  try {
+    worksheet.columns = Object.keys(data[0])
+      .map(function (obj) {
+        console.log('obj', obj)
+        return { header: obj, key: obj, width: 10 };
+      });
+      data.map(obj => {
+      worksheet.addRow(obj)
+    })
+
+    workbook.xlsx.writeFile(tempFilePath).then(function () {
+      console.log('file is written');
+      res.set('Content-Disposition', 'filename="' + filetodownload + '.xlsx"');
+      res.sendFile(tempFilePath, function (err) { console.log(err) });
+    });
+  } catch (err) { console.log(err) }
 }
